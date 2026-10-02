@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from ...audit import get_current_operator
+from ...session_ownership import verified_operator
 from ...utils import UTC, atomic_write_text, utc_now
 from ...witness import WitnessActionContext
 
@@ -31,6 +32,16 @@ MAX_ARCHIVE_MEMBERS = 2_000
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_BYTES = 256 * 1024 * 1024
 _COPY_CHUNK_BYTES = 64 * 1024
+
+# Plaintext state that earlier releases wrote beside a profile's state file:
+# decrypted copies made while a session opened ("auth-state-*.json") and
+# per-save temp files (".<name>.<random>.tmp.json"). A process that died at the
+# wrong moment left them behind, and an export must not carry them off.
+_PLAINTEXT_LEFTOVER = re.compile(r"auth-state-[^/\\]*\.json|\.[^/\\]*\.tmp\.json")
+
+
+def _skip_plaintext_leftovers(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    return None if _PLAINTEXT_LEFTOVER.fullmatch(PurePosixPath(member.name).name) else member
 
 
 class BrowserAuthProfileService:
@@ -530,14 +541,8 @@ class BrowserAuthProfileService:
 
     @staticmethod
     def verified_operator() -> str | None:
-        """The current operator, but only when it was actually proven.
-
-        `source: "header"` is a self-asserted label (see app/auth_policy.py), so
-        it can never grant access to a profile — anyone able to reach the API
-        could set it to any value.
-        """
-        operator = get_current_operator()
-        return operator.id if operator.source == "token" else None
+        """The current operator, but only when it was actually proven (see app/session_ownership.py)."""
+        return verified_operator()
 
     def require_access(self, profile_name: str, *, action: str) -> str | None:
         """Authorize this operator against a profile; return who now owns it.
@@ -713,7 +718,7 @@ class BrowserAuthProfileService:
     @staticmethod
     def write_tar(source_dir: Path, dest: Path) -> None:
         with tarfile.open(str(dest), "w:gz") as tar:
-            tar.add(str(source_dir), arcname=source_dir.name)
+            tar.add(str(source_dir), arcname=source_dir.name, filter=_skip_plaintext_leftovers)
 
     @staticmethod
     def safe_archive_member_name(member_name: str) -> PurePosixPath:

@@ -1,6 +1,6 @@
 """
 startup.extensions — Initialize the optional subsystems (mesh, harness, network
-inspector, workflows, curator) at app startup.
+inspector, curator) at app startup.
 
 Call register_extensions(app) from main.py after app creation.
 All clients are initialized from environment variables.
@@ -27,12 +27,10 @@ def register_extensions(app) -> None:
         delegation_manager  — DelegationManager
         network_inspectors  — dict[session_id, NetworkInspector]
         cdp_sessions        — dict[session_id, CDPPassthrough]
-        workflow_engine     — WorkflowEngine (no step actions are registered at startup)
     """
     _init_mesh(app)
     _init_harness(app)
     _init_network_stores(app)
-    _init_workflow_engine(app)
     _disable_extracted_social_state(app)
     _init_curator(app)
     _register_session_hooks(app)
@@ -45,7 +43,18 @@ def register_extensions(app) -> None:
 
 
 def _init_curator(app) -> None:
-    """Initialize the Skills Curator LLM adapter. None when no API key is set."""
+    """Initialize the Skills Curator LLM adapter, when CURATOR_ENABLED asks for it.
+
+    It used to start whenever a provider key was present — and ANTHROPIC_API_KEY
+    is there for anyone running the Claude agent provider — so every closed
+    session paid for an LLM call (claude-opus-4-7 by default) on a placeholder
+    transcript and wrote whatever came back to skills-staging.
+    """
+    settings = getattr(app.state, "settings", None)
+    if not getattr(settings, "curator_enabled", False):
+        app.state.curator_adapter = None
+        logger.info("startup.curator: disabled (set CURATOR_ENABLED=true to turn it on)")
+        return
     try:
         from app.curator_llm import build_curator_adapter
 
@@ -200,20 +209,6 @@ def _build_mesh_tool_gateway(app):
         return result
 
     return _call
-
-
-# ---------------------------------------------------------------------------
-# Workflow engine
-# ---------------------------------------------------------------------------
-
-
-def _init_workflow_engine(app) -> None:
-    from app.workflow.engine import WorkflowEngine
-
-    wf_root = Path(os.environ.get("WORKFLOWS_ROOT", "/data/workflows"))
-    engine = WorkflowEngine(workflows_root=wf_root)
-    app.state.workflow_engine = engine
-    logger.info("startup.workflow: engine initialized root=%s", wf_root)
 
 
 # ---------------------------------------------------------------------------

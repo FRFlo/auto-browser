@@ -15,7 +15,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, ValidationError
 
 from ..action_errors import BrowserActionError, SessionNotFoundError
-from ..approvals import ApprovalRequiredError
+from ..approvals import ApprovalRequiredError, held_for_execution
 from ..browser_scripts import PAGE_TEXT_SCRIPT
 from ..models import (
     ActionName,
@@ -267,6 +267,11 @@ class McpToolGateway:
                 )
             arguments = spec.input_model.model_validate(raw_arguments)
             arguments = await self._resolve_implicit_session(spec, arguments)
+            # Before the handler, for tools that read a session's records
+            # without resolving the session itself (witness, audit, downloads).
+            session_id = getattr(arguments, "session_id", None)
+            if isinstance(session_id, str) and session_id:
+                await self.manager.ensure_session_accessible(session_id)
             approval = await self._require_governed_tool_approval(
                 spec,
                 arguments,
@@ -276,12 +281,9 @@ class McpToolGateway:
             if approval is None:
                 result = await spec.handler(arguments)
             else:
-                await self.manager.approvals.claim_execution(approval.id)
-                try:
+                async with held_for_execution(self.manager.approvals, approval.id) as held:
                     result = await spec.handler(arguments)
-                    await self.manager.approvals.mark_executed(approval.id)
-                finally:
-                    self.manager.approvals.release_execution(approval.id)
+                    await held.executed()
             result = shape_mcp_result(spec.name, result, detail=getattr(arguments, "detail", "compact"))
             # The JSON stays the first block: clients (and the LangChain
             # adapter) read content[0].text as the result.
@@ -672,10 +674,17 @@ class McpToolGateway:
         return await self.manager.list_approvals(status=payload.status, session_id=payload.session_id)
 
     async def _approve_approval(self, payload: ApprovalDecisionInput) -> dict[str, Any]:
-        return await self.manager.approve(payload.approval_id, comment=payload.comment)
+        # The caller here is the agent whose action is waiting: approving it
+        # would make the approval meaningless unless the deployment opted in.
+        if not self.manager.settings.autonomous_approvals:
+            raise PermissionError(
+                "approvals come from an operator, in the dashboard or with POST /approvals/{id}/approve; "
+                "set AUTONOMOUS_APPROVALS=true on the controller to let agents approve their own actions"
+            )
+        return await self.manager.approve(payload.approval_id, comment=payload.comment, decided_via="agent")
 
     async def _reject_approval(self, payload: ApprovalDecisionInput) -> dict[str, Any]:
-        return await self.manager.reject(payload.approval_id, comment=payload.comment)
+        return await self.manager.reject(payload.approval_id, comment=payload.comment, decided_via="agent")
 
     async def _execute_approval(self, payload: ExecuteApprovalInput) -> dict[str, Any]:
         return await self.manager.execute_approval(payload.approval_id)
