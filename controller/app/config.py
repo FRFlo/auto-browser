@@ -185,6 +185,9 @@ class Settings(BaseSettings):
     max_sessions: int = Field(1, alias="MAX_SESSIONS")
     require_approval_for_uploads: bool = Field(True, alias="REQUIRE_APPROVAL_FOR_UPLOADS")
     approval_ttl_minutes: int = Field(15, alias="APPROVAL_TTL_MINUTES")
+    # Lets agents approve their own pending actions: MCP browser.approve_approval
+    # and the built-in agent loop. Off, an operator approves every one.
+    autonomous_approvals: bool = Field(False, alias="AUTONOMOUS_APPROVALS")
     witness_enabled: bool = Field(True, alias="WITNESS_ENABLED")
     witness_protection_mode_default: Literal["normal", "confidential"] = Field(
         "normal",
@@ -219,7 +222,7 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = Field(None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field("https://api.openai.com/v1", alias="OPENAI_BASE_URL")
-    openai_model: str = Field("gpt-5-mini", alias="OPENAI_MODEL")
+    openai_model: str = Field("gpt-6.1-sol", alias="OPENAI_MODEL")
     openai_auth_mode: str = Field("api", alias="OPENAI_AUTH_MODE")
     openai_cli_path: str = Field("codex", alias="OPENAI_CLI_PATH")
     openai_cli_model: str | None = Field(None, alias="OPENAI_CLI_MODEL")
@@ -324,6 +327,10 @@ class Settings(BaseSettings):
     # PII scrubbing
     pii_scrub_enabled: bool = Field(True, alias="PII_SCRUB_ENABLED")
     pii_scrub_screenshot: bool = Field(True, alias="PII_SCRUB_SCREENSHOT")
+    # Also redact the before/after snapshot of every action. It runs OCR twice
+    # per action; false makes actions much faster and leaves those images
+    # unredacted (observations stay redacted).
+    pii_scrub_action_screenshots: bool = Field(True, alias="PII_SCRUB_ACTION_SCREENSHOTS")
     pii_scrub_network: bool = Field(True, alias="PII_SCRUB_NETWORK")
     pii_scrub_console: bool = Field(True, alias="PII_SCRUB_CONSOLE")
     pii_scrub_patterns: str = Field("", alias="PII_SCRUB_PATTERNS")  # "" = all patterns
@@ -340,7 +347,13 @@ class Settings(BaseSettings):
     cdp_connect_url: str | None = Field(None, alias="CDP_CONNECT_URL")
 
     # Shadow browsing — enable headed mode for debugging
-    shadow_browse_enabled: bool = Field(True, alias="SHADOW_BROWSE_ENABLED")
+    # Off by default: it launches a headed Chromium inside the controller with
+    # its sandbox disabled, next to every secret the controller holds, and the
+    # shipped image has neither a browser nor a display for it anyway.
+    shadow_browse_enabled: bool = Field(False, alias="SHADOW_BROWSE_ENABLED")
+    # Post-session skill review by an LLM. Off unless asked for: it calls a paid
+    # model on every session close.
+    curator_enabled: bool = Field(False, alias="CURATOR_ENABLED")
 
     # Cron / webhook triggers
     cron_store_path: str = Field("/data/crons/crons.json", alias="CRON_STORE_PATH")

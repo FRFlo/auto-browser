@@ -2,7 +2,107 @@
 
 All notable changes to auto-browser are documented here.
 
-## [Unreleased]
+## [1.9.0] — 2026-10-02
+
+A security and correctness pass over 1.8.1, from a maintainer review: every finding was
+reproduced before it was fixed. The client, LangChain and MCP bridge packages are unchanged
+apart from their version.
+
+**If you run the controller with named credentials (`API_BEARER_TOKENS`) or keep settings in
+`.env`, read the upgrade notes first:** operators no longer share sessions, and every setting
+in `.env` now takes effect.
+
+Upgrade notes:
+- **Everything in `.env` now reaches the controller.** Docker Compose used to pass only the
+  keys it listed, so `API_BEARER_TOKENS`, `PII_SCRUB_*`, `WITNESS_*`, `SHARE_TOKEN_SECRET`,
+  `APPROVAL_WEBHOOK_*` and other documented settings set in `.env` were ignored. Check your
+  `.env` for values you did not mean to apply. Needs Docker Compose 2.24 or newer.
+- `SHADOW_BROWSE_ENABLED` and the new `CURATOR_ENABLED` default to `false`. The curator
+  reviewed every closed session with a paid model call whenever a provider key was set.
+- `scripts/verify_witness_bundle.py` fails a bundle with no signed receipt unless you pass
+  `--allow-unsigned`, and takes `--expect-key-id` and `--expect-head` to pin the signing key
+  and the chain head.
+- Staged skill candidates signed before this release fail verification, because their
+  envelopes carry no file hashes; induce them again.
+- A `type` action whose field will not keep keyboard focus now fails with `focus_lost`
+  instead of typing elsewhere.
+- `browser.approve_approval` over MCP (the `full` tool profile) refuses unless
+  `AUTONOMOUS_APPROVALS=true`. It let the agent whose action was waiting approve it. Operators
+  approve in the dashboard or with `POST /approvals/{id}/approve`, as before.
+- **With named credentials (`API_BEARER_TOKENS`), sessions belong to the operator who created
+  them**, as auth profiles already did. Other operators no longer see or use them. Sessions
+  created before the upgrade, and every session under the shared `API_BEARER_TOKEN`, stay
+  unowned and open to all.
+- `OPENAI_MODEL` defaults to `gpt-6.1-sol` (was `gpt-5-mini`). Set it to keep another model.
+
+### Security
+
+- Hardened approvals, navigation, the TOTP autofill, click and type targeting, PII scrubbing,
+  auth-state handling and witness bundle verification. Advisories will follow with details.
+- **Sessions are no longer shared between operators** under named credentials. Operator A could
+  drive operator B's logged-in session, read its pages and save its cookies to a profile of
+  their own, which got around auth profile ownership. Another operator's session is now left
+  out of listings and answers like one that does not exist: over REST, MCP and `/artifacts`,
+  with its approvals, agent jobs and cron jobs. Agent jobs run as the operator who queued them,
+  and cron jobs fire as their creator and may use only the auth profiles their creator can.
+  The audit log stays operator-wide.
+
+### Fixed
+
+- **Governed approvals work.** A governed payment, post, account change, destructive action
+  or upload through the MCP gateway failed with "already being executed" and never ran. A
+  governed write approval is consumed when its action runs, through the orchestrator and
+  `POST /approvals/{id}/execute` alike, and an expired approval is refused before its action
+  runs.
+- **A page that never answers cannot hang the controller.** A page running a script in an
+  endless loop hung `GET /sessions` and `DELETE /sessions/{id}`; with the default
+  `MAX_SESSIONS=1` it held the only slot until a restart. Listing no longer fails when a
+  session closes mid-list.
+- **The Claude provider works on Claude Opus 5.5, Sonnet 5.5 and Fable 5.1**, which reject a
+  forced tool choice, and has room for their thinking (16k output tokens instead of 1,024).
+- **The OpenAI provider works again.** OpenAI rejected every step: the request carried a schema
+  strict mode refuses and a `temperature` current models reject, and current models refuse
+  function tools on chat completions while they reason. It now uses the Responses API. The
+  OpenAI-compatible providers stay on chat completions and now send neither.
+- **PII scrubbing:** card numbers written in groups, provider API tokens, Basic credentials,
+  cookie headers and OAuth codes are redacted; screenshots are redacted a line at a time, so
+  phone numbers and grouped card numbers no longer slip through; console text that a page
+  writes can no longer stall the controller.
+- **Codespaces start**, with an API token generated into `.env`. `make doctor` sends the token
+  and refuses to run when it cannot see whether live sessions would be interrupted.
+- **Isolated sessions work from any checkout directory**: the browser image has a fixed name.
+- **Releases publish only commits on `main`.**
+- **The browser node waits for its display** before starting the takeover desktop, which
+  could otherwise fail silently while the container reported healthy.
+- **Memory profiles** whose names map to the same file (`github.com`, `github_com`) are no
+  longer merged.
+- `read_download` reads CSV files on Windows hosts, where the registry types them as Excel.
+
+### Changed
+
+- The test suite writes only to a temporary directory; it used to write into `./data` (and
+  under `make test`, into the real witness chains). Real-Chromium tests run in CI.
+
+### Added
+
+- `PII_SCRUB_ACTION_SCREENSHOTS` (default `true`). Redacting the before and after snapshots of
+  every action runs OCR twice per action; `false` skips it for those snapshots, which makes
+  actions much faster, while observation screenshots stay redacted.
+- The dashboard's Operator column shows who owns each session; it was always empty.
+- **Autonomous mode**, off by default: with `AUTONOMOUS_APPROVALS=true` agents approve their
+  own actions instead of waiting for an operator. The built-in agent approves and carries on,
+  and MCP clients may call `browser.approve_approval`. Every approval is still created and
+  recorded, marked `decided_via: agent` on the approval, in the audit log and in the witness
+  chain. An agent cannot overturn an operator's decision, or approve again an action an
+  operator rejected in that session; those wait for an operator.
+
+### Removed
+
+- **`/workflows`** (`POST /workflows/run`, `GET /workflows/runs`, `GET /workflows/runs/{id}`)
+  and the dashboard's Workflow Runs panel. The engine had no step actions registered, so every
+  run failed; it will come back when there are workflows to run with it. `WORKFLOWS_ROOT` is no
+  longer read, and run records already in `/data/workflows` can be deleted. A mesh peer asking
+  for a `workflow:` capability now gets "Unknown capability kind" instead of "not yet wired".
 
 ## [1.8.1] — 2026-09-26
 

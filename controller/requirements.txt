@@ -9,14 +9,14 @@
 # flattened Route objects. Never enumerate app.routes expecting .path -- use
 # app.openapi() or a request. The upper bound keeps minor bumps reviewed;
 # Dependabot moves it, so it is deliberately not restated as a number here.
-fastapi>=0.141.1,<0.142
-starlette==1.6.0
-uvicorn[standard]==0.52.4
+fastapi>=0.142.2,<0.143
+starlette==1.7.0
+uvicorn[standard]==0.54.0
 playwright==1.62.0
 pydantic-settings==2.15.0
 httpx==0.28.1
 redis==8.1.0
-cryptography==50.0.1
+cryptography==50.0.2
 Pillow==12.3.0
 pytesseract==0.3.13
 docker==7.2.0

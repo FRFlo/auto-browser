@@ -4,13 +4,17 @@ import asyncio
 import logging
 import random
 import re
+import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+from playwright.async_api import Error as PlaywrightError
 
 from ... import events as _events
 from ...action_errors import BrowserActionError
 from ...actions import ActionRunContext
-from ...approvals import ApprovalRequiredError
+from ...approvals import ApprovalRequiredError, held_for_execution
 from ...models import ApprovalKind, BrowserActionDecision, totp_host_allowed
 from ...utils import spawn_background_task
 from ...webhooks import dispatch_approval_event
@@ -27,6 +31,87 @@ if TYPE_CHECKING:
     from ...browser_manager import BrowserSession
 
 logger = logging.getLogger(__name__)
+
+# Times the human-like mouse path's 4-18 ms gaps. perf_counter, not the event
+# loop's clock: that is time.monotonic, which ticks every 15.6 ms on Windows
+# before Python 3.13, coarser than what is being measured.
+_step_clock = time.perf_counter
+
+# How long a click that only moves focus waits for its target to become
+# clickable before focusing it programmatically instead.
+_FOCUS_CLICK_TIMEOUT_MS = 1000
+
+# Whether the element (or a label for it) is what the pointer at (x, y) hits.
+# Runs in the element's own frame; a target inside a child frame was already
+# checked, across frame boundaries, by Playwright's trial click.
+_RECEIVES_POINTER_SCRIPT = """(el, [x, y]) => {
+  if (window !== window.top) return true;
+  let hit = document.elementFromPoint(x, y);
+  while (hit && hit.shadowRoot) {
+    const inner = hit.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === hit) break;
+    hit = inner;
+  }
+  if (!hit) return false;
+  const label = hit.closest ? hit.closest('label') : null;
+  if (label && label.control === el) return true;
+  for (let node = hit; node; node = node.parentNode || node.host) {
+    if (node === el) return true;
+  }
+  return false;
+}"""
+
+# Where the TOTP autofill looks for a one-time-code field, most specific first.
+# Every candidate must still pass is_one_time_code_field.
+_ONE_TIME_CODE_FIELD_SELECTORS = (
+    'input[autocomplete="one-time-code"]',
+    'input[name*="otp" i]',
+    'input[id*="otp" i]',
+    'input[inputmode="numeric"][maxlength="6"]',
+    'input[name*="code" i]',
+    'input[id*="code" i]',
+    'input[aria-label*="code" i]',
+    'input[placeholder*="code" i]',
+)
+_MAX_CODE_FIELD_CANDIDATES = 5
+_ONE_TIME_CODE_INPUT_TYPES = frozenset({"", "text", "tel", "number", "password"})
+# Words that say a field holds some other kind of code. The autofill typed live
+# one-time codes into promo, ZIP and card-security fields because their names
+# contain "code"; missing a real code field only means the agent types it.
+_NOT_A_ONE_TIME_CODE = re.compile(
+    r"zip|postal|postcode|promo|coupon|discount|voucher|gift|referr|invite|country|area|region|"
+    r"phone|\btel\b|currency|locale|lang|product|sku|order|track|captcha|cvv|cvc|csc|card|cc-",
+    re.IGNORECASE,
+)
+_FIELD_ATTRIBUTES_SCRIPT = """(el) => ({
+  type: el.getAttribute('type') || '',
+  name: el.getAttribute('name') || '',
+  id: el.id || '',
+  placeholder: el.getAttribute('placeholder') || '',
+  'aria-label': el.getAttribute('aria-label') || '',
+  autocomplete: el.getAttribute('autocomplete') || '',
+})"""
+
+
+def is_one_time_code_field(attributes: Mapping[str, Any]) -> bool:
+    """Whether an input's own attributes say it takes a one-time code."""
+    if str(attributes.get("type") or "").strip().lower() not in _ONE_TIME_CODE_INPUT_TYPES:
+        return False
+    if str(attributes.get("autocomplete") or "").strip().lower() == "one-time-code":
+        return True
+    described = " ".join(
+        str(attributes.get(key) or "") for key in ("name", "id", "placeholder", "aria-label", "autocomplete")
+    )
+    return not _NOT_A_ONE_TIME_CODE.search(described)
+
+
+# Whether keyboard focus is in the element or inside it, shadow roots included.
+_HAS_FOCUS_SCRIPT = """(el) => {
+  for (let node = el.getRootNode().activeElement; node; node = node.parentNode || node.host) {
+    if (node === el) return true;
+  }
+  return false;
+}"""
 
 
 class BrowserActionService:
@@ -82,7 +167,7 @@ class BrowserActionService:
                     await locator.click()
                 else:
                     target["x"], target["y"] = coords
-                    await self.click_human_like(session, coords[0], coords[1])
+                    await self.click_locator_human_like(session, locator, coords)
             await self.manager._settle(session.page)
 
         return await self.manager._run_action(session, "click", target, operation)
@@ -172,7 +257,7 @@ class BrowserActionService:
                 payload.pop("text_preview", None)
                 payload["text_redacted"] = True
             await locator.scroll_into_view_if_needed()
-            await self.focus_locator(session, locator)
+            await self.focus_verified(session, locator, action="type")
             if clear_first:
                 await session.page.keyboard.press("Control+a")
                 await asyncio.sleep(0.03)
@@ -267,80 +352,76 @@ class BrowserActionService:
             "runtime_requires_approval": approval is not None or approval_id is not None,
             "sensitive_input": bool(getattr(decision, "sensitive", False)),
         }
-        # Uploads go through manager.upload, which checks and claims the
-        # approval itself.
-        claimed = approval is not None and decision.action != "upload"
         try:
-            if claimed:
-                await self.manager.approvals.claim_execution(approval.id)
-            if decision.action == "navigate":
-                result = await self.manager.navigate(session_id, decision.url or "")
-            elif decision.action == "click":
-                result = await self.manager.click(
-                    session_id,
-                    selector=decision.selector,
-                    element_id=decision.element_id,
-                    x=decision.x,
-                    y=decision.y,
-                )
-            elif decision.action == "hover":
-                result = await self.manager.hover(
-                    session_id,
-                    selector=decision.selector,
-                    element_id=decision.element_id,
-                    x=decision.x,
-                    y=decision.y,
-                )
-            elif decision.action == "select_option":
-                result = await self.manager.select_option(
-                    session_id,
-                    selector=decision.selector,
-                    element_id=decision.element_id,
-                    value=decision.value,
-                    label=decision.label,
-                    index=decision.index,
-                )
-            elif decision.action == "type":
-                result = await self.manager.type(
-                    session_id,
-                    selector=decision.selector,
-                    element_id=decision.element_id,
-                    text=decision.text or "",
-                    clear_first=decision.clear_first,
-                    sensitive=decision.sensitive,
-                )
-            elif decision.action == "press":
-                result = await self.manager.press(session_id, decision.key or "")
-            elif decision.action == "scroll":
-                result = await self.manager.scroll(session_id, decision.delta_x, decision.delta_y)
-            elif decision.action == "wait":
-                result = await self.manager.wait(session_id, decision.wait_ms)
-            elif decision.action == "reload":
-                result = await self.manager.reload(session_id)
-            elif decision.action == "go_back":
-                result = await self.manager.go_back(session_id)
-            elif decision.action == "go_forward":
-                result = await self.manager.go_forward(session_id)
-            elif decision.action == "upload":
-                result = await self.manager.upload(
-                    session_id,
-                    selector=decision.selector,
-                    element_id=decision.element_id,
-                    file_path=decision.file_path or "",
-                    approved=False,
-                    approval_id=approval_id,
-                )
+            # Uploads go through manager.upload, which checks and claims the
+            # approval itself.
+            if approval is None or decision.action == "upload":
+                return await self._dispatch_decision(session_id, decision, approval_id=approval_id)
+            async with held_for_execution(self.manager.approvals, approval.id) as held:
+                result = await self._dispatch_decision(session_id, decision, approval_id=approval_id)
+                await held.executed()
                 return result
-            else:  # pragma: no cover - guarded by schema
-                raise ValueError(f"Unsupported action: {decision.action}")
-
-            if approval is not None:
-                await self.manager.approvals.mark_executed(approval.id)
-            return result
         finally:
             session.pending_witness_context = None
-            if claimed:
-                self.manager.approvals.release_execution(approval.id)
+
+    async def _dispatch_decision(
+        self,
+        session_id: str,
+        decision: BrowserActionDecision,
+        *,
+        approval_id: str | None,
+    ) -> dict[str, Any]:
+        if decision.action == "navigate":
+            return await self.manager.navigate(session_id, decision.url or "")
+        if decision.action in {"click", "hover"}:
+            run = self.manager.click if decision.action == "click" else self.manager.hover
+            return await run(
+                session_id,
+                selector=decision.selector,
+                element_id=decision.element_id,
+                x=decision.x,
+                y=decision.y,
+            )
+        if decision.action == "select_option":
+            return await self.manager.select_option(
+                session_id,
+                selector=decision.selector,
+                element_id=decision.element_id,
+                value=decision.value,
+                label=decision.label,
+                index=decision.index,
+            )
+        if decision.action == "type":
+            return await self.manager.type(
+                session_id,
+                selector=decision.selector,
+                element_id=decision.element_id,
+                text=decision.text or "",
+                clear_first=decision.clear_first,
+                sensitive=decision.sensitive,
+            )
+        if decision.action == "press":
+            return await self.manager.press(session_id, decision.key or "")
+        if decision.action == "scroll":
+            return await self.manager.scroll(session_id, decision.delta_x, decision.delta_y)
+        if decision.action == "wait":
+            return await self.manager.wait(session_id, decision.wait_ms)
+        if decision.action == "reload":
+            return await self.manager.reload(session_id)
+        if decision.action == "go_back":
+            return await self.manager.go_back(session_id)
+        if decision.action == "go_forward":
+            return await self.manager.go_forward(session_id)
+        if decision.action == "upload":
+            return await self.manager.upload(
+                session_id,
+                selector=decision.selector,
+                element_id=decision.element_id,
+                file_path=decision.file_path or "",
+                approved=False,
+                approval_id=approval_id,
+            )
+        raise ValueError(f"Unsupported action: {decision.action}")  # pragma: no cover - guarded by schema
 
     async def require_decision_approval(
         self,
@@ -533,19 +614,18 @@ class BrowserActionService:
             start_y + (y - start_y) * random.uniform(0.5, 0.9) + random.randint(-60, 60),
         )
         steps = random.randint(18, 34)
-        loop = asyncio.get_running_loop()
         for step in range(1, steps + 1):
             t = step / steps
             inv = 1 - t
             px = inv**3 * start_x + 3 * inv * inv * t * control_1[0] + 3 * inv * t * t * control_2[0] + t**3 * x
             py = inv**3 * start_y + 3 * inv * inv * t * control_1[1] + 3 * inv * t * t * control_2[1] + t**3 * y
-            step_started = loop.time()
+            step_started = _step_clock()
             await session.page.mouse.move(px, py)
             # The gap between moves is meant to be 4-18 ms. A move already waits
             # for the browser to dispatch it (about a frame, ~17 ms, in Chromium),
             # and sleeping the whole gap on top of that made each step 20-35 ms:
             # a 26-step path took ~670 ms of every click. Sleep only what is left.
-            remaining = random.uniform(0.004, 0.018) - (loop.time() - step_started)
+            remaining = random.uniform(0.004, 0.018) - (_step_clock() - step_started)
             if remaining > 0:
                 await asyncio.sleep(remaining)
         session.mouse_position = (x, y)
@@ -554,19 +634,89 @@ class BrowserActionService:
         jitter_x = x + random.uniform(-2.5, 2.5)
         jitter_y = y + random.uniform(-2.5, 2.5)
         await self.move_mouse_human_like(session, jitter_x, jitter_y)
+        await self._press_mouse(session, jitter_x, jitter_y)
+
+    async def _press_mouse(self, session: "BrowserSession", x: float, y: float) -> None:
         await asyncio.sleep(random.uniform(0.03, 0.12))
         await session.page.mouse.down()
         await asyncio.sleep(random.uniform(0.02, 0.08))
         await session.page.mouse.up()
-        session.mouse_position = (jitter_x, jitter_y)
+        session.mouse_position = (x, y)
+
+    async def click_locator_human_like(
+        self,
+        session: "BrowserSession",
+        locator: Any,
+        coords: tuple[float, float],
+        *,
+        timeout_ms: float | None = None,
+    ) -> None:
+        """Click `locator` along a human-like path, but only if it is what the pointer hits.
+
+        Pressing the mouse at an element's centre sends the click to whatever is
+        on top there: a transparent element over a "Save draft" button took the
+        click, while the approval and the audit trail named the button. Playwright's
+        own checks run first (visible, stable, enabled, receiving events at its
+        click point, frames included), and the point is checked again once the
+        pointer has arrived, so a cover put up during the move is caught as well.
+        When that last check fails the click goes to Playwright's `click()`,
+        which clicks the element if it can and otherwise refuses — it never
+        clicks what covers it.
+        """
+        await locator.click(trial=True, timeout=timeout_ms)
+        x = coords[0] + random.uniform(-2.5, 2.5)
+        y = coords[1] + random.uniform(-2.5, 2.5)
+        await self.move_mouse_human_like(session, x, y)
+        if await self._receives_pointer_at(locator, x, y):
+            await self._press_mouse(session, x, y)
+        else:
+            await locator.click(timeout=timeout_ms)
+
+    @staticmethod
+    async def _receives_pointer_at(locator: Any, x: float, y: float) -> bool:
+        try:
+            return bool(await locator.evaluate(_RECEIVES_POINTER_SCRIPT, [x, y]))
+        except Exception:
+            return False
 
     async def focus_locator(self, session: "BrowserSession", locator: Any) -> None:
         coords = await self.locator_center(locator)
         if coords is None:
             await locator.click()
         else:
-            await self.click_human_like(session, coords[0], coords[1])
+            await self.click_locator_human_like(session, locator, coords, timeout_ms=_FOCUS_CLICK_TIMEOUT_MS)
         await asyncio.sleep(0.05 + random.random() * 0.1)
+
+    async def focus_verified(self, session: "BrowserSession", locator: Any, *, action: str) -> None:
+        """Put keyboard focus in `locator` and prove it is there before anything is typed.
+
+        Keystrokes go to whatever has focus. A field that hands focus on to
+        another one, or a click that never reached the field, sent the text —
+        sometimes a password — somewhere the caller did not name.
+        """
+        try:
+            await self.focus_locator(session, locator)
+        except PlaywrightError:
+            # Covered or not clickable: focus it without clicking anything.
+            pass
+        if await self._has_focus(locator):
+            return
+        await locator.focus()
+        if await self._has_focus(locator):
+            return
+        raise BrowserActionError(
+            "Keyboard focus would not stay in the target field, so nothing was typed.",
+            action=action,
+            code="focus_lost",
+            retryable=True,
+        )
+
+    @staticmethod
+    async def _has_focus(locator: Any) -> bool:
+        try:
+            return bool(await locator.evaluate(_HAS_FOCUS_SCRIPT))
+        except Exception:
+            return False
 
     async def type_text_human_like(self, page: "Page", text: str) -> None:
         for index, char in enumerate(text):
@@ -579,14 +729,21 @@ class BrowserActionService:
                 delay_ms += random.randint(180, 600)
             await asyncio.sleep(delay_ms / 1000)
 
-    async def first_visible_locator(self, page: "Page", selectors: list[str]) -> tuple[Any, str] | None:
-        for selector in selectors:
+    async def _find_one_time_code_field(self, page: "Page") -> tuple[Any, str] | None:
+        for selector in _ONE_TIME_CODE_FIELD_SELECTORS:
             try:
-                locator = page.locator(selector).first
-                if await locator.count() > 0 and await locator.is_visible():
-                    return locator, selector
-            except Exception:
+                candidates = await page.locator(selector).all()
+            except PlaywrightError:
                 continue
+            for candidate in candidates[:_MAX_CODE_FIELD_CANDIDATES]:
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    attributes = await candidate.evaluate(_FIELD_ATTRIBUTES_SCRIPT)
+                except PlaywrightError:
+                    continue  # detached while we looked; the next candidate may still do
+                if is_one_time_code_field(attributes):
+                    return candidate, selector
         return None
 
     async def maybe_handle_totp(self, session: "BrowserSession") -> dict[str, Any] | None:
@@ -605,17 +762,7 @@ class BrowserActionService:
                 retryable=False,
                 details={"url": session.page.url},
             )
-        selectors = [
-            'input[autocomplete="one-time-code"]',
-            'input[inputmode="numeric"][maxlength="6"]',
-            'input[name*="otp" i]',
-            'input[name*="code" i]',
-            'input[id*="otp" i]',
-            'input[id*="code" i]',
-            'input[aria-label*="code" i]',
-            'input[placeholder*="code" i]',
-        ]
-        located = await self.first_visible_locator(session.page, selectors)
+        located = await self._find_one_time_code_field(session.page)
         if located is None:
             return None
 
@@ -624,30 +771,17 @@ class BrowserActionService:
         if not self._totp_host_allowed(session):
             return None
         code = pyotp.TOTP(session.totp_secret).now()
-        await self.focus_locator(session, locator)
+        await self.focus_verified(session, locator, action="totp_fill")
         try:
             await locator.fill("")
         except Exception:
             await session.page.keyboard.press("Control+a")
             await session.page.keyboard.press("Delete")
         await self.type_text_human_like(session.page, code)
-        submit = await self.first_visible_locator(
-            session.page,
-            [
-                'button[type="submit"]',
-                '[aria-label*="verify" i][role="button"]',
-                'button:has-text("Verify")',
-                'button:has-text("Continue")',
-                'button:has-text("Next")',
-                'button:has-text("Submit")',
-            ],
-        )
-        if submit is not None:
-            coords = await self.locator_center(submit[0])
-            if coords is None:
-                await submit[0].click()
-            else:
-                await self.click_human_like(session, coords[0], coords[1])
+        # Enter submits the form the code went into. This used to click the
+        # first submit button anywhere on the page — on a checkout page that
+        # was "Place order", clicked with no approval anywhere in this path.
+        await locator.press("Enter")
         await self.manager._settle(session.page)
         return {"selector": selector, "code_length": len(code)}
 

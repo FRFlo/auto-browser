@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from ...action_errors import SessionNotFoundError
 from ...browser_scripts import apply_stealth
 from ...models import SessionRecord, SessionStatus, resolve_totp_hosts
 from ...network_inspector import NetworkInspector
+from ...session_ownership import may_use, verified_operator
 from ...utils import UTC
 
 if TYPE_CHECKING:
@@ -22,6 +24,16 @@ if TYPE_CHECKING:
     from ...session_isolation import IsolatedBrowserRuntime
 
 logger = logging.getLogger(__name__)
+
+# page.title() and page.evaluate() have no timeout, and a page running a script
+# in an endless loop never answers them. These bound what the session list and
+# close_session wait for, so one such page cannot hang either of them.
+PAGE_TITLE_TIMEOUT_SECONDS = 2.0
+# How long close_session waits for an action to release the session before it
+# closes the browser context out from under it.
+CLOSE_LOCK_WAIT_SECONDS = 10.0
+# Each teardown step (trace, context, isolated runtime) gets at most this long.
+TEARDOWN_STEP_TIMEOUT_SECONDS = 30.0
 
 
 class BrowserSessionService:
@@ -37,8 +49,16 @@ class BrowserSessionService:
         self._creating = 0
 
     async def list(self) -> list[dict[str, Any]]:
-        session_map = {record.id: record.model_dump() for record in await self.manager.session_store.list()}
-        for session in self.manager.sessions.values():
+        session_map = {
+            record.id: record.model_dump()
+            for record in await self.manager.session_store.list()
+            if may_use(record.owner)
+        }
+        # A snapshot: summaries await, and a session created or closed meanwhile
+        # changed the dict mid-iteration ("dictionary changed size").
+        for session in list(self.manager.sessions.values()):
+            if not may_use(session.owner):
+                continue
             summary = await self.manager._session_summary(session)
             session_map[summary["id"]] = summary
         return sorted(
@@ -76,7 +96,6 @@ class BrowserSessionService:
 
         session_id = uuid4().hex[:12]
         artifact_dir, auth_dir, upload_dir = self.prepare_dirs(session_id)
-        prepared_auth_state = None
         source_path: Path | None = None
 
         if proxy_persona:
@@ -102,8 +121,7 @@ class BrowserSessionService:
         elif storage_state_path:
             source_path = self.manager.auth_profiles.storage_state_source(storage_state_path)
         if source_path is not None:
-            prepared_auth_state = self.manager.auth_state.prepare_for_context(source_path)
-            context_kwargs["storage_state"] = str(prepared_auth_state.path)
+            context_kwargs["storage_state"] = self.manager.auth_state.prepare_for_context(source_path).storage_state
 
         context: BrowserContext | None = None
         session: BrowserSession | None = None
@@ -154,6 +172,7 @@ class BrowserSessionService:
                 totp_secret=totp_secret,
                 totp_hosts=resolved_totp_hosts,
                 witness_remote_state=self.manager._initial_witness_remote_state(resolved_protection_mode),
+                owner=verified_operator(),
             )
             if source_path is not None:
                 session.last_auth_state_path = source_path
@@ -244,8 +263,6 @@ class BrowserSessionService:
         finally:
             if reserved:
                 self._creating -= 1
-            if prepared_auth_state is not None:
-                prepared_auth_state.cleanup()
 
     def check_limit(self) -> None:
         if len(self.manager.sessions) + self._creating >= self.manager.settings.max_sessions:
@@ -338,17 +355,44 @@ class BrowserSessionService:
         session = self.manager.sessions.get(session_id)
         if session is None:
             raise SessionNotFoundError(session_id, status=await self._recorded_status(session_id))
+        if not may_use(session.owner):
+            # Another operator's session answers as if it did not exist.
+            raise SessionNotFoundError(session_id)
         return session
 
     async def get_record(self, session_id: str) -> dict[str, Any]:
         session = self.manager.sessions.get(session_id)
         if session is not None:
+            if not may_use(session.owner):
+                raise SessionNotFoundError(session_id)
             return await self.manager._session_summary(session)
         try:
             record = await self.manager.session_store.get(session_id)
         except KeyError:
             raise SessionNotFoundError(session_id) from None
+        if not may_use(record.owner):
+            raise SessionNotFoundError(session_id)
         return record.model_dump()
+
+    async def owner_of(self, session_id: str) -> str | None:
+        """Who owns a session, live or recorded; None when unowned or unknown."""
+        session = self.manager.sessions.get(session_id)
+        if session is not None:
+            return session.owner
+        try:
+            record = await self.manager.session_store.get(session_id)
+        except KeyError:
+            return None
+        return record.owner
+
+    async def ensure_accessible(self, session_id: str) -> None:
+        """Refuse a session that belongs to another operator, as if it did not exist.
+
+        For entry points that address a session by id but never resolve it
+        through get(): diagnostics that read its files, approvals, agent jobs.
+        """
+        if not may_use(await self.owner_of(session_id)):
+            raise SessionNotFoundError(session_id)
 
     async def _recorded_status(self, session_id: str) -> str | None:
         """Status of a session that is not live, from its persisted record, if any.
@@ -361,11 +405,12 @@ class BrowserSessionService:
         except Exception:  # message enrichment only; any store failure means "unknown"
             logger.debug("no readable record for session %s", session_id, exc_info=True)
             return None
-        return record.status
+        return record.status if may_use(record.owner) else None
 
     async def close(self, session_id: str) -> dict[str, Any]:
         session = await self.manager.get_session(session_id)
-        async with session.lock:
+        locked = await self._lock_for_close(session)
+        try:
             if self.manager.sessions.get(session_id) is not session:
                 # Closed by a concurrent call while this one waited for the
                 # lock. Carrying on released the tunnel and runtime twice and
@@ -416,6 +461,30 @@ class BrowserSessionService:
             summary["witness_remote"] = session.witness_remote_state.model_dump()
             await self.manager.session_store.upsert(SessionRecord.model_validate(summary))
             return {"closed": True, "trace_path": str(session.trace_path), "session": summary}
+        finally:
+            if locked:
+                session.lock.release()
+
+    async def _lock_for_close(self, session: "BrowserSession") -> bool:
+        """Take the session lock for closing, even from an action stuck on its page.
+
+        An action waiting on a page that never answers holds the lock forever.
+        Closing the browser context fails that wait, which releases the lock.
+        Returns whether the lock is held; close goes ahead without it rather
+        than leave the session — and its MAX_SESSIONS slot — stuck until restart.
+        """
+        try:
+            await asyncio.wait_for(session.lock.acquire(), timeout=CLOSE_LOCK_WAIT_SECONDS)
+            return True
+        except TimeoutError:
+            logger.warning("session %s is busy; closing its browser context so it can be closed", session.id)
+        await self._teardown_step(session, "close a stuck browser context", session.context.close)
+        try:
+            await asyncio.wait_for(session.lock.acquire(), timeout=CLOSE_LOCK_WAIT_SECONDS)
+            return True
+        except TimeoutError:
+            logger.warning("session %s is still busy after its context closed; closing it anyway", session.id)
+            return False
 
     async def _release_resources(self, session: "BrowserSession") -> None:
         """Tear down everything a live session holds, each step independently.
@@ -440,7 +509,9 @@ class BrowserSessionService:
     @staticmethod
     async def _teardown_step(session: "BrowserSession", label: str, step: Any) -> None:
         try:
-            await step()
+            await asyncio.wait_for(step(), timeout=TEARDOWN_STEP_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning("gave up waiting to %s for session %s", label, session.id)
         except Exception as exc:
             logger.warning("failed to %s for session %s: %s", label, session.id, exc)
 
@@ -574,7 +645,11 @@ class BrowserSessionService:
         if callable(is_closed) and is_closed():
             return "", "", False
         try:
-            return page.url, await page.title(), True
+            return page.url, await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_SECONDS), True
+        except TimeoutError:
+            # Live, but its renderer is not answering (a script in an endless
+            # loop). Without a bound this hung every listing and every close.
+            return page.url, "", True
         except PlaywrightError as exc:
             logger.debug("page snapshot failed for session %s: %s", session.id, exc)
             return "", "", False
@@ -610,6 +685,7 @@ class BrowserSessionService:
             "proxy_persona": session.proxy_persona,
             "protection_mode": session.protection_mode,
             "witness_remote": session.witness_remote_state.model_dump(),
+            "owner": session.owner,
         }
 
     async def get_summary(self, session_id: str) -> dict[str, Any]:

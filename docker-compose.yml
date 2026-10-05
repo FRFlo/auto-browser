@@ -2,6 +2,11 @@ services:
   browser-node:
     build:
       context: ./browser-node
+    # A fixed name: isolated sessions start containers from this image
+    # (ISOLATED_BROWSER_IMAGE), and Compose otherwise names it after the
+    # checkout directory, so a clone not called "auto-browser" (a GitHub
+    # "Download ZIP" is auto-browser-main) could not start one.
+    image: auto-browser-browser-node:latest
     shm_size: 2gb
     restart: unless-stopped
     # Health means "the Playwright server the controller connects to is up",
@@ -73,6 +78,14 @@ services:
     depends_on:
       browser-node:
         condition: service_healthy
+    # Every setting in .env reaches the controller. Only the keys listed under
+    # `environment` used to, so API_BEARER_TOKENS, PII_SCRUB_*, WITNESS_*,
+    # SHARE_TOKEN_SECRET, APPROVAL_WEBHOOK_* and ~90 more that .env.example
+    # documents were silently ignored. Entries under `environment` still win,
+    # which keeps the container paths below fixed. Needs Compose v2.24+.
+    env_file:
+      - path: .env
+        required: false
     environment:
       APP_ENV: ${APP_ENV:-development}
       API_BEARER_TOKEN: ${API_BEARER_TOKEN:-}
@@ -135,7 +148,7 @@ services:
       CONNECT_RETRY_DELAY_SECONDS: ${CONNECT_RETRY_DELAY_SECONDS:-1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6.1-sol}
       OPENAI_AUTH_MODE: ${OPENAI_AUTH_MODE:-api}
       OPENAI_CLI_PATH: ${OPENAI_CLI_PATH:-codex}
       OPENAI_CLI_MODEL: ${OPENAI_CLI_MODEL:-}

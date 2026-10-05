@@ -37,6 +37,8 @@ from .config import Settings
 from .downloads import DownloadCaptureService
 from .memory_manager import MemoryManager
 from .models import (
+    HTTP_URL_SCHEMES,
+    ApprovalDecider,
     BrowserActionDecision,
     SessionStatus,
     WitnessRemoteState,
@@ -45,6 +47,7 @@ from .network_inspector import NetworkInspector
 from .ocr import OCRExtractor
 from .pii_scrub import PiiScrubber
 from .session_isolation import DockerBrowserNodeProvisioner, IsolatedBrowserRuntime
+from .session_ownership import as_system
 from .session_store import DurableSessionStore
 from .session_tunnel import IsolatedSessionTunnel, IsolatedSessionTunnelBroker
 from .url_safety import browser_equivalent_url
@@ -128,6 +131,9 @@ class BrowserSession:
     pending_witness_context: dict[str, Any] | None = None
     witness_remote_state: WitnessRemoteState = field(default_factory=WitnessRemoteState)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # The token-verified operator who created it; None for an unowned session
+    # (see app/session_ownership.py).
+    owner: str | None = None
 
 
 SessionCreatedHook = Callable[[str, Page], Awaitable[None]]
@@ -259,11 +265,13 @@ class BrowserManager:
     async def shutdown(self) -> None:
         logger.info("shutting down browser manager")
         session_ids = list(self.sessions.keys())
-        for session_id in session_ids:
-            try:
-                await self.close_session(session_id)
-            except Exception as exc:  # pragma: no cover - best effort cleanup
-                logger.warning("failed to close session %s during shutdown: %s", session_id, exc)
+        # Every operator's sessions close, not only those of whoever is current.
+        with as_system():
+            for session_id in session_ids:
+                try:
+                    await self.close_session(session_id)
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    logger.warning("failed to close session %s during shutdown: %s", session_id, exc)
 
         self.browser = None
         if self.playwright is not None:
@@ -339,6 +347,12 @@ class BrowserManager:
     async def get_session_record(self, session_id: str) -> dict[str, Any]:
         return await self.session_lifecycle.get_record(session_id)
 
+    async def ensure_session_accessible(self, session_id: str) -> None:
+        await self.session_lifecycle.ensure_accessible(session_id)
+
+    async def session_owner(self, session_id: str) -> str | None:
+        return await self.session_lifecycle.owner_of(session_id)
+
     async def get_session_summary(self, session_id: str) -> dict[str, Any]:
         """Public API for getting a session summary by ID."""
         return await self.session_lifecycle.get_summary(session_id)
@@ -405,11 +419,23 @@ class BrowserManager:
     async def get_approval(self, approval_id: str) -> dict[str, Any]:
         return await self.approval_service.get(approval_id)
 
-    async def approve(self, approval_id: str, comment: str | None = None) -> dict[str, Any]:
-        return await self.approval_service.approve(approval_id, comment=comment)
+    async def approve(
+        self,
+        approval_id: str,
+        comment: str | None = None,
+        *,
+        decided_via: ApprovalDecider = "operator",
+    ) -> dict[str, Any]:
+        return await self.approval_service.approve(approval_id, comment=comment, decided_via=decided_via)
 
-    async def reject(self, approval_id: str, comment: str | None = None) -> dict[str, Any]:
-        return await self.approval_service.reject(approval_id, comment=comment)
+    async def reject(
+        self,
+        approval_id: str,
+        comment: str | None = None,
+        *,
+        decided_via: ApprovalDecider = "operator",
+    ) -> dict[str, Any]:
+        return await self.approval_service.reject(approval_id, comment=comment, decided_via=decided_via)
 
     async def execute_approval(self, approval_id: str) -> dict[str, Any]:
         return await self.approval_service.execute(approval_id)
@@ -650,7 +676,13 @@ class BrowserManager:
     def _assert_url_allowed(self, url: str) -> None:
         # Parsed as the browser will parse it, not as urllib does — see
         # app/url_safety.py for the backslash host confusion this closes.
-        host = urlparse(browser_equivalent_url(url)).hostname
+        parsed = urlparse(browser_equivalent_url(url))
+        # The scheme is decided here, not left to each request model: the REST
+        # fork route had none, and file://localhost/... passed this gate on the
+        # strength of its host and opened local files in the browser.
+        if parsed.scheme.lower() not in HTTP_URL_SCHEMES:
+            raise PermissionError(f"URL scheme {parsed.scheme!r} is not allowed; only http and https are")
+        host = parsed.hostname
         if not host:
             raise PermissionError(f"Could not determine hostname for URL: {url}")
         patterns = self.settings.allowed_host_patterns
@@ -665,7 +697,9 @@ class BrowserManager:
 
     def _assert_runtime_url_allowed(self, url: str) -> None:
         parsed = urlparse(url)
-        if parsed.scheme in {"about", "data", "blob", ""}:
+        # Where a page may legitimately be after an action: a blank or
+        # script-built document, or Chromium's own page for a failed load.
+        if parsed.scheme in {"about", "data", "blob", "chrome-error", ""}:
             return
         self._assert_url_allowed(url)
 
